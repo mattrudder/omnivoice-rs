@@ -24,6 +24,7 @@ use crate::{
     error::ServerError,
     openai::{SpeechRequest, SpeechResponseFormat, SpeechStreamFormat},
     runtime::AppState,
+    voices::PreloadedVoice,
 };
 
 pub struct ParsedSpeechRequest {
@@ -85,15 +86,20 @@ pub async fn parse_http_speech_request(
             .map_err(|error| ServerError::validation(error.to_string()))?
     };
 
-    parse_speech_request(request, &state.config.served_model_id)
+    parse_speech_request(request, &state.config.served_model_id, state)
 }
 
 fn parse_speech_request(
     request: SpeechRequestParts,
     served_model_id: &str,
+    state: &AppState,
 ) -> Result<ParsedSpeechRequest, ServerError> {
     validate_model_name(&request.model, served_model_id)?;
-    let _ = request.voice.as_ref();
+    let voice_name = request
+        .voice
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
     let response_format = parse_response_format(&request.response_format)?;
     let stream_format = parse_stream_format(request.stream_format.as_deref())?;
     let speed = request.speed.unwrap_or(1.0);
@@ -142,6 +148,21 @@ fn parse_speech_request(
         generation_request.ref_audios = vec![Some(ref_audio)];
     } else if let Some(ref_audio) = request.extra.get("ref_audio") {
         generation_request.ref_audios = vec![Some(parse_data_uri_audio(ref_audio)?)];
+    } else if !state.voices_is_empty() {
+        let resolved = if let Some(ref name) = voice_name {
+            state.lookup_voice(name).or_else(|| state.default_voice_prompt())
+        } else {
+            state.default_voice_prompt()
+        };
+        match resolved {
+            Some(PreloadedVoice::Clone(prompt)) => {
+                generation_request.voice_clone_prompts = vec![Some(prompt)];
+            }
+            Some(PreloadedVoice::Design(instruct)) => {
+                generation_request.instructs = vec![Some(instruct)];
+            }
+            None => {}
+        }
     }
     let seed_override = parse_optional_u64(&request.extra, "seed")?;
 

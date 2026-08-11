@@ -3,6 +3,7 @@ use omnivoice_server::{
     build_router,
     error::ServerError,
     runtime::{AppState, PipelineSpeechRuntime, ServerConfig},
+    voices::{preload_voices, VoiceConfig},
     ServerArgs,
 };
 use tokio::net::TcpListener;
@@ -23,6 +24,18 @@ async fn main() -> Result<(), ServerError> {
     let config = ServerConfig::from_args(&args)?;
     let host = args.host.clone();
     let port = args.port;
+
+    // Parse and validate the voices config before binding — fast failure on bad paths.
+    let voice_config = args
+        .voices
+        .as_deref()
+        .map(|path| {
+            let cfg = VoiceConfig::from_path(path)?;
+            cfg.validate()?;
+            Ok::<_, ServerError>(cfg)
+        })
+        .transpose()?;
+
     let state = AppState::starting(config);
 
     let app = build_router(state.clone());
@@ -30,11 +43,21 @@ async fn main() -> Result<(), ServerError> {
 
     info!("omnivoice-server listening on http://{host}:{port}");
     tokio::task::spawn_blocking(move || {
-        match PipelineSpeechRuntime::from_options(runtime_options) {
-            Ok(runtime) => {
-                state.install_runtime(runtime);
-                info!("omnivoice-server runtime is ready");
+        let init = (|| -> Result<(), ServerError> {
+            use omnivoice_infer::pipeline::Phase3Pipeline;
+            let pipeline = Phase3Pipeline::from_options(runtime_options)?;
+            if let Some(cfg) = &voice_config {
+                info!("tokenizing {} voice(s)...", cfg.voices.len());
+                let voices = preload_voices(cfg, &pipeline)?;
+                state.install_voices(voices, cfg.default_voice.clone());
+                info!("voices ready");
             }
+            let runtime = PipelineSpeechRuntime::from_pipeline(pipeline);
+            state.install_runtime(runtime);
+            Ok(())
+        })();
+        match init {
+            Ok(()) => info!("omnivoice-server runtime is ready"),
             Err(error) => {
                 state.mark_failed();
                 error!("omnivoice-server runtime failed to initialize: {:?}", error);

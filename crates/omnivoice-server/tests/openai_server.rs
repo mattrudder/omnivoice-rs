@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::Cursor,
     sync::{Arc, Mutex},
     time::Duration,
@@ -11,12 +12,15 @@ use axum::{
 use base64::Engine as _;
 use http_body_util::BodyExt;
 use omnivoice_infer::{
-    contracts::{DecodedAudio, GenerationRequest, GenerationUsage, ReferenceAudioInput},
+    contracts::{
+        DecodedAudio, GenerationRequest, GenerationUsage, ReferenceAudioInput, VoiceClonePrompt,
+    },
     GeneratedAudioResult,
 };
 use omnivoice_server::{
     build_router,
     runtime::{AppState, ServerConfig, SpeechRuntime},
+    voices::PreloadedVoice,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -80,6 +84,10 @@ impl SpeechRuntime for RecordingRuntime {
         *self.inner.last_seed.lock().unwrap() = Some(seed);
         Ok(())
     }
+
+    fn sample_rate(&self) -> Option<u32> {
+        Some(self.inner.response.audio.sample_rate)
+    }
 }
 
 fn app_with_runtime() -> (axum::Router, RecordingRuntime) {
@@ -95,6 +103,37 @@ fn app_with_runtime() -> (axum::Router, RecordingRuntime) {
     };
     let app = build_router(AppState::new(runtime.clone(), config));
     (app, runtime)
+}
+
+/// Voices deliberately installed out of alphabetical order, so a listing that
+/// merely echoes insertion order fails the sort assertion.
+fn app_with_voices() -> axum::Router {
+    let runtime = RecordingRuntime::new();
+    let config = ServerConfig {
+        served_model_id: MODEL_ID.to_string(),
+        api_key: API_KEY.to_string(),
+        base_path: String::new(),
+        max_body_bytes: 5 * 1024 * 1024,
+        max_concurrent_requests: 1,
+        mp3_bitrate_kbps: 128,
+        request_timeout: Duration::from_secs(30),
+    };
+    let state = AppState::new(runtime, config);
+    let mut voices = HashMap::new();
+    voices.insert(
+        "steve".to_string(),
+        PreloadedVoice::Design("male, low pitch".to_string()),
+    );
+    voices.insert(
+        "juniper".to_string(),
+        PreloadedVoice::Clone(VoiceClonePrompt::new_empty("hello")),
+    );
+    voices.insert(
+        "jade".to_string(),
+        PreloadedVoice::Clone(VoiceClonePrompt::new_empty("hello")),
+    );
+    state.install_voices(voices, Some("jade".to_string()));
+    build_router(state)
 }
 
 fn app_with_config(config: ServerConfig) -> (axum::Router, RecordingRuntime) {
@@ -352,6 +391,82 @@ async fn options_preflight_is_available_for_public_routes() {
             .headers()
             .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
     }
+}
+
+#[tokio::test]
+async fn voices_endpoint_returns_sorted_listing() {
+    let app = app_with_voices();
+    let response = app
+        .oneshot(auth_request("GET", "/v1/audio/voices", Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["object"], "list");
+    assert_eq!(payload["default"], "jade");
+    assert_eq!(payload["sample_rate"], 24_000);
+    assert_eq!(payload["data"][0]["id"], "jade");
+    assert_eq!(payload["data"][0]["object"], "voice");
+    assert_eq!(payload["data"][0]["type"], "clone");
+    assert_eq!(payload["data"][1]["id"], "juniper");
+    assert_eq!(payload["data"][2]["id"], "steve");
+    assert_eq!(payload["data"][2]["type"], "design");
+}
+
+#[tokio::test]
+async fn voices_endpoint_reports_empty_listing_without_a_config() {
+    let (app, _) = app_with_runtime();
+    let response = app
+        .oneshot(auth_request("GET", "/v1/audio/voices", Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["data"].as_array().unwrap().len(), 0);
+    assert!(payload["default"].is_null());
+}
+
+#[tokio::test]
+async fn voices_endpoint_requires_auth() {
+    let app = app_with_voices();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/audio/voices")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 401);
+}
+
+/// Voices install with the runtime, so answering 200 with an empty list here
+/// would be indistinguishable from a server started without `--voices`.
+#[tokio::test]
+async fn voices_endpoint_returns_503_while_runtime_is_starting() {
+    let config = ServerConfig {
+        served_model_id: MODEL_ID.to_string(),
+        api_key: API_KEY.to_string(),
+        base_path: String::new(),
+        max_body_bytes: 5 * 1024 * 1024,
+        max_concurrent_requests: 1,
+        mp3_bitrate_kbps: 128,
+        request_timeout: Duration::from_secs(30),
+    };
+    let app = build_router(AppState::starting(config));
+
+    let response = app
+        .oneshot(auth_request("GET", "/v1/audio/voices", Body::empty()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

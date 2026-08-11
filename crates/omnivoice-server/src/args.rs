@@ -46,6 +46,9 @@ pub struct ServerArgs {
 
     #[arg(long, default_value_t = 300)]
     pub request_timeout_secs: u64,
+
+    #[arg(long)]
+    pub voices: Option<PathBuf>,
 }
 
 impl ServerArgs {

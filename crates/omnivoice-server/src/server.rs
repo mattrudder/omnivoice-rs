@@ -12,7 +12,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::{
     audio::{build_audio_response, parse_http_speech_request},
     error::ServerError,
-    openai::{HealthResponse, ModelObject, ModelsResponse},
+    openai::{HealthResponse, ModelObject, ModelsResponse, VoiceObject, VoicesResponse},
     runtime::{AppState, RuntimeStatus},
 };
 
@@ -23,6 +23,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(root))
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/audio/voices", get(audio_voices))
         .route("/v1/audio/speech", post(audio_speech))
         .layer(DefaultBodyLimit::max(max_body_bytes));
     let router = if base_path.is_empty() {
@@ -70,6 +71,37 @@ async fn models(
             created: 0,
             owned_by: "FerrisMind",
         }],
+    }))
+}
+
+async fn audio_voices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ServerError> {
+    authorize(&headers, &state)?;
+    // ⛔ 503 WHILE STARTING, NOT AN EMPTY LIST. Voices are installed with the
+    // runtime, so before that this would answer 200 with `data: []` — which is
+    // indistinguishable from a server started without `--voices`, and a client
+    // that caches the listing would cache the wrong one permanently.
+    if state.status() != RuntimeStatus::Ready {
+        return Err(ServerError::service_unavailable("runtime is not ready"));
+    }
+    // An empty list past that point is the honest answer: startup rejects a bad
+    // voices config before binding, so a ready server with no voices was simply
+    // not given any.
+    Ok(Json(VoicesResponse {
+        object: "list",
+        default: state.default_voice_name(),
+        sample_rate: state.sample_rate(),
+        data: state
+            .voice_listing()
+            .into_iter()
+            .map(|(id, kind)| VoiceObject {
+                id,
+                object: "voice",
+                r#type: kind,
+            })
+            .collect(),
     }))
 }
 

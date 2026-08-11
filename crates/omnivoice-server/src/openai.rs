@@ -49,6 +49,25 @@ pub struct ModelObject {
 }
 
 #[derive(Debug, Serialize)]
+pub struct VoicesResponse {
+    pub object: &'static str,
+    /// Used when a request omits `voice`, or names one that is not loaded.
+    pub default: Option<String>,
+    /// Output sample rate, so a client asking for headerless `pcm` can build a
+    /// WAV header without hardcoding it.
+    pub sample_rate: Option<u32>,
+    pub data: Vec<VoiceObject>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoiceObject {
+    pub id: String,
+    pub object: &'static str,
+    /// `clone` or `design`.
+    pub r#type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
     pub service: &'static str,

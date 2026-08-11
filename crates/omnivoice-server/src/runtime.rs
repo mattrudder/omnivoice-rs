@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, RwLock,
@@ -11,7 +12,7 @@ use omnivoice_infer::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{args::ServerArgs, error::ServerError};
+use crate::{args::ServerArgs, error::ServerError, voices::PreloadedVoice};
 
 pub trait SpeechRuntime: Send + Sync {
     fn synthesize(
@@ -21,6 +22,11 @@ pub trait SpeechRuntime: Send + Sync {
 
     fn set_seed(&self, _seed: u64) -> omnivoice_infer::Result<()> {
         Ok(())
+    }
+
+    /// Output sample rate, when the runtime knows it before generating.
+    fn sample_rate(&self) -> Option<u32> {
+        None
     }
 
     fn synthesize_with_seed(
@@ -53,6 +59,13 @@ impl PipelineSpeechRuntime {
             inference_lock: Mutex::new(()),
         })
     }
+
+    pub fn from_pipeline(pipeline: Phase3Pipeline) -> Self {
+        Self {
+            pipeline,
+            inference_lock: Mutex::new(()),
+        }
+    }
 }
 
 impl SpeechRuntime for PipelineSpeechRuntime {
@@ -78,6 +91,13 @@ impl SpeechRuntime for PipelineSpeechRuntime {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         self.pipeline.stage0().set_seed(seed)
+    }
+
+    fn sample_rate(&self) -> Option<u32> {
+        // Read from the manifest rather than the inference lock: this is a
+        // static model property, and a listing request must not queue behind
+        // an in-flight synthesis.
+        Some(self.pipeline.runtime_artifacts().contracts().sample_rate)
     }
 
     fn synthesize_with_seed(
@@ -155,6 +175,8 @@ pub struct AppState {
     status: Arc<RwLock<RuntimeStatus>>,
     pub config: Arc<ServerConfig>,
     pub limiter: Arc<Semaphore>,
+    voices: Arc<RwLock<HashMap<String, PreloadedVoice>>>,
+    default_voice: Arc<RwLock<Option<String>>>,
 }
 
 impl AppState {
@@ -169,6 +191,8 @@ impl AppState {
             status: Arc::new(RwLock::new(RuntimeStatus::Ready)),
             config: Arc::new(config),
             limiter,
+            voices: Arc::new(RwLock::new(HashMap::new())),
+            default_voice: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -179,6 +203,8 @@ impl AppState {
             status: Arc::new(RwLock::new(RuntimeStatus::Starting)),
             config: Arc::new(config),
             limiter,
+            voices: Arc::new(RwLock::new(HashMap::new())),
+            default_voice: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -201,6 +227,51 @@ impl AppState {
             .status
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = RuntimeStatus::Failed;
+    }
+
+    pub fn install_voices(
+        &self,
+        voices: HashMap<String, PreloadedVoice>,
+        default_voice: Option<String>,
+    ) {
+        *self.voices.write().unwrap() = voices;
+        *self.default_voice.write().unwrap() = default_voice;
+    }
+
+    pub fn lookup_voice(&self, name: &str) -> Option<PreloadedVoice> {
+        self.voices.read().unwrap().get(name).cloned()
+    }
+
+    pub fn default_voice_prompt(&self) -> Option<PreloadedVoice> {
+        let name = self.default_voice.read().unwrap().clone()?;
+        self.voices.read().unwrap().get(&name).cloned()
+    }
+
+    pub fn voices_is_empty(&self) -> bool {
+        self.voices.read().unwrap().is_empty()
+    }
+
+    /// (name, kind) for every loaded voice, sorted by name.
+    ///
+    /// Sorted because the backing map's iteration order is not stable, and a
+    /// listing that reshuffles between calls is hostile to anything diffing or
+    /// caching it.
+    pub fn voice_listing(&self) -> Vec<(String, &'static str)> {
+        let voices = self.voices.read().unwrap();
+        let mut listing: Vec<(String, &'static str)> = voices
+            .iter()
+            .map(|(name, voice)| (name.clone(), voice.kind()))
+            .collect();
+        listing.sort_by(|a, b| a.0.cmp(&b.0));
+        listing
+    }
+
+    pub fn default_voice_name(&self) -> Option<String> {
+        self.default_voice.read().unwrap().clone()
+    }
+
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.runtime().and_then(|runtime| runtime.sample_rate())
     }
 
     pub fn runtime(&self) -> Option<Arc<dyn SpeechRuntime>> {
